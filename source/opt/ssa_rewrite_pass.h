@@ -298,6 +298,13 @@ class SSARewritePass : public MemPass {
 
   const char* name() const override { return "ssa-rewrite"; }
   Status Process() override;
+
+  // Phis are registered as they are made and replaced loads go through
+  // ReplaceAllUsesWith/KillInst, so the def-use graph is kept current; without
+  // this the next pass rebuilt it from scratch.
+  IRContext::Analysis GetPreservedAnalyses() override {
+    return IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping;
+  }
 };
 
 }  // namespace opt
