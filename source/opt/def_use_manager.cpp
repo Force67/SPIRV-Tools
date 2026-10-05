@@ -14,6 +14,8 @@
 
 #include "source/opt/def_use_manager.h"
 
+#include <algorithm>
+
 namespace spvtools {
 namespace opt {
 namespace analysis {
@@ -21,12 +23,12 @@ namespace analysis {
 void DefUseManager::AnalyzeInstDef(Instruction* inst) {
   const uint32_t def_id = inst->result_id();
   if (def_id != 0) {
-    auto iter = id_to_def_.find(def_id);
-    if (iter != id_to_def_.end()) {
+    if (Instruction* old = GetDef(def_id)) {
       // Clear the original instruction that defining the same result id of the
       // new instruction.
-      ClearInst(iter->second);
+      ClearInst(old);
     }
+    if (def_id >= id_to_def_.size()) id_to_def_.resize(def_id + 1, nullptr);
     id_to_def_[def_id] = inst;
   } else {
     ClearInst(inst);
@@ -54,7 +56,7 @@ void DefUseManager::AnalyzeInstUse(Instruction* inst) {
         uint32_t use_id = inst->GetSingleWordOperand(i);
         Instruction* def = GetDef(use_id);
         assert(def && "Definition is not registered.");
-        id_to_users_.insert(UserEntry{def, inst});
+        id_to_users_[def].insert(UserEntry{def, inst});
         used_ids->push_back(use_id);
       } break;
       default:
@@ -74,8 +76,7 @@ void DefUseManager::AnalyzeInstDefUse(Instruction* inst) {
 void DefUseManager::UpdateDefUse(Instruction* inst) {
   const uint32_t def_id = inst->result_id();
   if (def_id != 0) {
-    auto iter = id_to_def_.find(def_id);
-    if (iter == id_to_def_.end()) {
+    if (!GetDef(def_id)) {
       AnalyzeInstDef(inst);
     }
   }
@@ -83,32 +84,17 @@ void DefUseManager::UpdateDefUse(Instruction* inst) {
 }
 
 Instruction* DefUseManager::GetDef(uint32_t id) {
-  auto iter = id_to_def_.find(id);
-  if (iter == id_to_def_.end()) return nullptr;
-  return iter->second;
+  return id < id_to_def_.size() ? id_to_def_[id] : nullptr;
 }
 
 const Instruction* DefUseManager::GetDef(uint32_t id) const {
-  const auto iter = id_to_def_.find(id);
-  if (iter == id_to_def_.end()) return nullptr;
-  return iter->second;
+  return id < id_to_def_.size() ? id_to_def_[id] : nullptr;
 }
 
-DefUseManager::IdToUsersMap::const_iterator DefUseManager::UsersBegin(
+const DefUseManager::UserSet* DefUseManager::Users(
     const Instruction* def) const {
-  return id_to_users_.lower_bound(
-      UserEntry{const_cast<Instruction*>(def), nullptr});
-}
-
-bool DefUseManager::UsersNotEnd(const IdToUsersMap::const_iterator& iter,
-                                const IdToUsersMap::const_iterator& cached_end,
-                                const Instruction* inst) const {
-  return (iter != cached_end && iter->def == inst);
-}
-
-bool DefUseManager::UsersNotEnd(const IdToUsersMap::const_iterator& iter,
-                                const Instruction* inst) const {
-  return UsersNotEnd(iter, id_to_users_.end(), inst);
+  const auto iter = id_to_users_.find(def);
+  return iter == id_to_users_.end() ? nullptr : &iter->second;
 }
 
 bool DefUseManager::WhileEachUser(
@@ -118,9 +104,10 @@ bool DefUseManager::WhileEachUser(
          "Definition is not registered.");
   if (!def->HasResultId()) return true;
 
-  auto end = id_to_users_.end();
-  for (auto iter = UsersBegin(def); UsersNotEnd(iter, end, def); ++iter) {
-    if (!f(iter->user)) return false;
+  const UserSet* users = Users(def);
+  if (!users) return true;
+  for (const UserEntry& entry : *users) {
+    if (!f(entry.user)) return false;
   }
   return true;
 }
@@ -151,9 +138,10 @@ bool DefUseManager::WhileEachUse(
          "Definition is not registered.");
   if (!def->HasResultId()) return true;
 
-  auto end = id_to_users_.end();
-  for (auto iter = UsersBegin(def); UsersNotEnd(iter, end, def); ++iter) {
-    Instruction* user = iter->user;
+  const UserSet* users = Users(def);
+  if (!users) return true;
+  for (const UserEntry& entry : *users) {
+    Instruction* user = entry.user;
     for (uint32_t idx = 0; idx != user->NumOperands(); ++idx) {
       const Operand& op = user->GetOperand(idx);
       if (op.type != SPV_OPERAND_TYPE_RESULT_ID && spvIsIdType(op.type)) {
@@ -235,13 +223,9 @@ void DefUseManager::ClearInst(Instruction* inst) {
     EraseUseRecordsOfOperandIds(inst);
     if (inst->result_id() != 0) {
       // Remove all uses of this inst.
-      auto users_begin = UsersBegin(inst);
-      auto end = id_to_users_.end();
-      auto new_end = users_begin;
-      for (; UsersNotEnd(new_end, end, inst); ++new_end) {
-      }
-      id_to_users_.erase(users_begin, new_end);
-      id_to_def_.erase(inst->result_id());
+      id_to_users_.erase(inst);
+      if (inst->result_id() < id_to_def_.size())
+        id_to_def_[inst->result_id()] = nullptr;
     }
   }
 }
@@ -252,8 +236,10 @@ void DefUseManager::EraseUseRecordsOfOperandIds(const Instruction* inst) {
   auto iter = inst_to_used_ids_.find(inst);
   if (iter != inst_to_used_ids_.end()) {
     for (auto use_id : iter->second) {
-      id_to_users_.erase(
-          UserEntry{GetDef(use_id), const_cast<Instruction*>(inst)});
+      Instruction* def = GetDef(use_id);
+      auto users = id_to_users_.find(def);
+      if (users != id_to_users_.end())
+        users->second.erase(UserEntry{def, const_cast<Instruction*>(inst)});
     }
     inst_to_used_ids_.erase(iter);
   }
@@ -263,31 +249,39 @@ bool CompareAndPrintDifferences(const DefUseManager& lhs,
                                 const DefUseManager& rhs) {
   bool same = true;
 
-  if (lhs.id_to_def_ != rhs.id_to_def_) {
-    for (auto p : lhs.id_to_def_) {
-      if (rhs.id_to_def_.find(p.first) == rhs.id_to_def_.end()) {
-        printf("Diff in id_to_def: missing value in rhs\n");
-      }
+  const size_t ids = std::max(lhs.id_to_def_.size(), rhs.id_to_def_.size());
+  for (uint32_t id = 0; id < ids; ++id) {
+    const bool in_lhs = lhs.GetDef(id) != nullptr;
+    const bool in_rhs = rhs.GetDef(id) != nullptr;
+    if (in_lhs && !in_rhs) {
+      printf("Diff in id_to_def: missing value in rhs\n");
+      same = false;
+    } else if (!in_lhs && in_rhs) {
+      printf("Diff in id_to_def: missing value in lhs\n");
+      same = false;
+    } else if (lhs.GetDef(id) != rhs.GetDef(id)) {
+      same = false;
     }
-    for (auto p : rhs.id_to_def_) {
-      if (lhs.id_to_def_.find(p.first) == lhs.id_to_def_.end()) {
-        printf("Diff in id_to_def: missing value in lhs\n");
-      }
-    }
-    same = false;
   }
 
-  if (lhs.id_to_users_ != rhs.id_to_users_) {
-    for (auto p : lhs.id_to_users_) {
-      if (rhs.id_to_users_.count(p) == 0) {
-        printf("Diff in id_to_users: missing value in rhs\n");
+  // An empty set and no set both mean "no users".
+  const auto users_missing_from = [](const DefUseManager& from,
+                                     const DefUseManager& in) {
+    bool missing = false;
+    for (const auto& p : in.id_to_users_) {
+      const DefUseManager::UserSet* other = from.Users(p.first);
+      for (const UserEntry& entry : p.second) {
+        if (!other || other->count(entry) == 0) missing = true;
       }
     }
-    for (auto p : rhs.id_to_users_) {
-      if (lhs.id_to_users_.count(p) == 0) {
-        printf("Diff in id_to_users: missing value in lhs\n");
-      }
-    }
+    return missing;
+  };
+  if (users_missing_from(rhs, lhs)) {
+    printf("Diff in id_to_users: missing value in rhs\n");
+    same = false;
+  }
+  if (users_missing_from(lhs, rhs)) {
+    printf("Diff in id_to_users: missing value in lhs\n");
     same = false;
   }
 

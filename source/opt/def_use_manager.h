@@ -30,9 +30,20 @@ namespace analysis {
 // Definition should never be null. User can be null, however, such an entry
 // should be used only for searching (e.g. all users of a particular definition)
 // and never stored in a container.
+//
+// The unique ids are cached so ordering never has to load the instructions; a
+// null instruction has id 0, below every real one.
 struct UserEntry {
+  UserEntry(Instruction* d, Instruction* u)
+      : def(d),
+        user(u),
+        def_uid(d ? d->unique_id() : 0),
+        user_uid(u ? u->unique_id() : 0) {}
+
   Instruction* def;
   Instruction* user;
+  uint32_t def_uid;
+  uint32_t user_uid;
 };
 
 inline bool operator==(const UserEntry& lhs, const UserEntry& rhs) {
@@ -50,31 +61,14 @@ inline bool operator==(const UserEntry& lhs, const UserEntry& rhs) {
 // definition (i.e. using {def, nullptr}).
 struct UserEntryLess {
   bool operator()(const UserEntry& lhs, const UserEntry& rhs) const {
-    // If lhs.def and rhs.def are both null, fall through to checking the
-    // second entries.
-    if (!lhs.def && rhs.def) return true;
-    if (lhs.def && !rhs.def) return false;
-
-    // If neither definition is null, then compare unique ids.
-    if (lhs.def && rhs.def) {
-      if (lhs.def->unique_id() < rhs.def->unique_id()) return true;
-      if (rhs.def->unique_id() < lhs.def->unique_id()) return false;
-    }
-
-    // Return false on equality.
-    if (!lhs.user && !rhs.user) return false;
-    if (!lhs.user) return true;
-    if (!rhs.user) return false;
-
-    // If neither user is null then compare unique ids.
-    return lhs.user->unique_id() < rhs.user->unique_id();
+    if (lhs.def_uid != rhs.def_uid) return lhs.def_uid < rhs.def_uid;
+    return lhs.user_uid < rhs.user_uid;
   }
 };
 
 // A class for analyzing and managing defs and uses in an Module.
 class DefUseManager {
  public:
-  using IdToDefMap = std::unordered_map<uint32_t, Instruction*>;
 
   // Constructs a def-use manager from the given |module|. All internal messages
   // will be communicated to the outside via the given message |consumer|. This
@@ -172,9 +166,6 @@ class DefUseManager {
   // instructions which decorate the decoration group will not be returned.
   std::vector<Instruction*> GetAnnotations(uint32_t id) const;
 
-  // Returns the map from ids to their def instructions.
-  const IdToDefMap& id_to_defs() const { return id_to_def_; }
-
   // Clear the internal def-use record of the given instruction |inst|. This
   // method will update the use information of the operand ids of |inst|. The
   // record: |inst| uses an |id|, will be removed from the use records of |id|.
@@ -193,31 +184,23 @@ class DefUseManager {
   void UpdateDefUse(Instruction* inst);
 
  private:
-  using IdToUsersMap = std::set<UserEntry, UserEntryLess>;
+  // Each definition's users, ordered by user. One small set per definition
+  // rather than one module-wide set: lookups stay shallow, and the map's nodes
+  // never move, so a set iterated while users are added stays valid.
+  using UserSet = std::set<UserEntry, UserEntryLess>;
+  using IdToUsersMap = std::unordered_map<const Instruction*, UserSet>;
   using InstToUsedIdsMap =
       std::unordered_map<const Instruction*, std::vector<uint32_t>>;
 
-  // Returns the first location that {|def|, nullptr} could be inserted into the
-  // users map without violating ordering.
-  IdToUsersMap::const_iterator UsersBegin(const Instruction* def) const;
-
-  // Returns true if |iter| has not reached the end of |def|'s users.
-  //
-  // In the first version |iter| is compared against the end of the map for
-  // validity before other checks. In the second version, |iter| is compared
-  // against |cached_end| for validity before other checks. This allows caching
-  // the map's end which is a performance improvement on some platforms.
-  bool UsersNotEnd(const IdToUsersMap::const_iterator& iter,
-                   const Instruction* def) const;
-  bool UsersNotEnd(const IdToUsersMap::const_iterator& iter,
-                   const IdToUsersMap::const_iterator& cached_end,
-                   const Instruction* def) const;
+  // The users of |def|, or null if none were ever recorded.
+  const UserSet* Users(const Instruction* def) const;
 
   // Analyzes the defs and uses in the given |module| and populates data
   // structures in this class. Does nothing if |module| is nullptr.
   void AnalyzeDefUse(Module* module);
 
-  IdToDefMap id_to_def_;      // Mapping from ids to their definitions
+  // Mapping from ids to their definitions, indexed by id (null if none).
+  std::vector<Instruction*> id_to_def_;
   IdToUsersMap id_to_users_;  // Mapping from ids to their users
   // Mapping from instructions to the ids used in the instruction.
   InstToUsedIdsMap inst_to_used_ids_;
