@@ -39,12 +39,12 @@ void DefUseManager::AnalyzeInstUse(Instruction* inst) {
   // Create entry for the given instruction. Note that the instruction may
   // not have any in-operands. In such cases, we still need a entry for those
   // instructions so this manager knows it has seen the instruction later.
-  auto* used_ids = &inst_to_used_ids_[inst];
-  if (used_ids->size()) {
+  auto* records = &inst_to_used_ids_[inst];
+  if (records->size()) {
     EraseUseRecordsOfOperandIds(inst);
-    used_ids = &inst_to_used_ids_[inst];
+    records = &inst_to_used_ids_[inst];
   }
-  used_ids->clear();  // It might have existed before.
+  records->clear();  // It might have existed before.
 
   for (uint32_t i = 0; i < inst->NumOperands(); ++i) {
     switch (inst->GetOperand(i).type) {
@@ -56,8 +56,10 @@ void DefUseManager::AnalyzeInstUse(Instruction* inst) {
         uint32_t use_id = inst->GetSingleWordOperand(i);
         Instruction* def = GetDef(use_id);
         assert(def && "Definition is not registered.");
-        id_to_users_[def].insert(UserEntry{def, inst});
-        used_ids->push_back(use_id);
+        UserSet& users = id_to_users_[def];
+        const auto inserted = users.insert(UserEntry{def, inst});
+        // An id used twice is one record, dropped once.
+        if (inserted.second) records->push_back({&users, inserted.first});
       } break;
       default:
         break;
@@ -222,8 +224,22 @@ void DefUseManager::ClearInst(Instruction* inst) {
   if (iter != inst_to_used_ids_.end()) {
     EraseUseRecordsOfOperandIds(inst);
     if (inst->result_id() != 0) {
-      // Remove all uses of this inst.
-      id_to_users_.erase(inst);
+      // Remove all uses of this inst, and each user's record of its use.
+      auto users = id_to_users_.find(inst);
+      if (users != id_to_users_.end()) {
+        for (const UserEntry& entry : users->second) {
+          auto records = inst_to_used_ids_.find(entry.user);
+          if (records == inst_to_used_ids_.end()) continue;
+          auto& list = records->second;
+          for (size_t i = 0; i < list.size(); ++i) {
+            if (list[i].users == &users->second) {
+              list.erase(list.begin() + i);
+              break;
+            }
+          }
+        }
+        id_to_users_.erase(users);
+      }
       if (inst->result_id() < id_to_def_.size())
         id_to_def_[inst->result_id()] = nullptr;
     }
@@ -235,12 +251,8 @@ void DefUseManager::EraseUseRecordsOfOperandIds(const Instruction* inst) {
   // uses of them.
   auto iter = inst_to_used_ids_.find(inst);
   if (iter != inst_to_used_ids_.end()) {
-    for (auto use_id : iter->second) {
-      Instruction* def = GetDef(use_id);
-      auto users = id_to_users_.find(def);
-      if (users != id_to_users_.end())
-        users->second.erase(UserEntry{def, const_cast<Instruction*>(inst)});
-    }
+    for (const UseRecord& record : iter->second)
+      record.users->erase(record.entry);
     inst_to_used_ids_.erase(iter);
   }
 }
@@ -285,18 +297,29 @@ bool CompareAndPrintDifferences(const DefUseManager& lhs,
     same = false;
   }
 
-  if (lhs.inst_to_used_ids_ != rhs.inst_to_used_ids_) {
-    for (auto p : lhs.inst_to_used_ids_) {
-      if (rhs.inst_to_used_ids_.count(p.first) == 0) {
-        printf("Diff in inst_to_used_ids: missing value in rhs\n");
-      }
+  // The records hold iterators, which only compare within one manager; compare
+  // the definitions they point at.
+  const auto used_defs = [](const DefUseManager& m, const Instruction* inst) {
+    std::vector<const Instruction*> defs;
+    auto iter = m.inst_to_used_ids_.find(inst);
+    if (iter != m.inst_to_used_ids_.end())
+      for (const DefUseManager::UseRecord& record : iter->second)
+        defs.push_back(record.entry->def);
+    return defs;
+  };
+  for (const auto& p : lhs.inst_to_used_ids_) {
+    if (rhs.inst_to_used_ids_.count(p.first) == 0) {
+      printf("Diff in inst_to_used_ids: missing value in rhs\n");
+      same = false;
+    } else if (used_defs(lhs, p.first) != used_defs(rhs, p.first)) {
+      same = false;
     }
-    for (auto p : rhs.inst_to_used_ids_) {
-      if (lhs.inst_to_used_ids_.count(p.first) == 0) {
-        printf("Diff in inst_to_used_ids: missing value in lhs\n");
-      }
+  }
+  for (const auto& p : rhs.inst_to_used_ids_) {
+    if (lhs.inst_to_used_ids_.count(p.first) == 0) {
+      printf("Diff in inst_to_used_ids: missing value in lhs\n");
+      same = false;
     }
-    same = false;
   }
 
   return same;

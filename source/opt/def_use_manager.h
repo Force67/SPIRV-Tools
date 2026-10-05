@@ -21,6 +21,7 @@
 
 #include "source/opt/instruction.h"
 #include "source/opt/module.h"
+#include "source/util/small_vector.h"
 #include "spirv-tools/libspirv.hpp"
 
 namespace spvtools {
@@ -189,8 +190,15 @@ class DefUseManager {
   // never move, so a set iterated while users are added stays valid.
   using UserSet = std::set<UserEntry, UserEntryLess>;
   using IdToUsersMap = std::unordered_map<const Instruction*, UserSet>;
+  // Where one use of an instruction is recorded, so dropping it needs no
+  // search through what can be a set of tens of thousands of users (a type's).
+  struct UseRecord {
+    UserSet* users;
+    UserSet::iterator entry;
+  };
+  // Inline storage: most instructions use at most a type and three ids.
   using InstToUsedIdsMap =
-      std::unordered_map<const Instruction*, std::vector<uint32_t>>;
+      std::unordered_map<const Instruction*, utils::SmallVector<UseRecord, 4>>;
 
   // The users of |def|, or null if none were ever recorded.
   const UserSet* Users(const Instruction* def) const;
@@ -202,7 +210,7 @@ class DefUseManager {
   // Mapping from ids to their definitions, indexed by id (null if none).
   std::vector<Instruction*> id_to_def_;
   IdToUsersMap id_to_users_;  // Mapping from ids to their users
-  // Mapping from instructions to the ids used in the instruction.
+  // Mapping from instructions to the records of the ids they use.
   InstToUsedIdsMap inst_to_used_ids_;
 };
 
